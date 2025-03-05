@@ -1,0 +1,35 @@
+{% extends "_base.html" %}
+
+{% block content %}
+    <h1>Contract List</h1>
+    <table>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Sender</th>
+                <th>Client</th>
+                <th>Is Signed</th>
+                <th>Sign Date</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for contract in contract_list %}
+            <tr>
+                <td>{{ contract.document_id }} </td>
+                <td>{{ contract.user_name }} </td>
+                <td>{{ contract.recipient_name }} </td>
+                <td>{{ contract.is_signed }}</td>
+                <td>{{ contract.created_at}}</td>
+        
+            </tr>
+            <td>
+                <form method="post">
+                    {% csrf_token %}
+                    <input type="hidden" name="contract_id" value="{{ contract.id }}">
+                    <button type="submit">Refresh</button>
+                </form>
+            </td>
+        {% endfor %}
+        </tbody>
+    </table>
+{% endblock %}

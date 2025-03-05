@@ -1,0 +1,4 @@
+docusign-esign==3.10.0
+requests==2.26.0
+Django==3.2.7
+gunicorn==20.1.0

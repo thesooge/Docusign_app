@@ -1,0 +1,7 @@
+{% extends '_base.html' %}
+{% block content %}
+<h2>Contract Signed Successfully!</h2>
+<p>Thank you for signing the contract. Both parties will receive a confirmation email.</p>
+<a href="/contracts/create/">Create Another Contract</a>
+<a href="{% url 'contract_list' %}">View All Contracts</a>
+{% endblock %}

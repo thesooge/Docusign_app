@@ -1,0 +1,17 @@
+{% extends '_base.html' %}
+{% block content %}
+<h2>Create Contract</h2>
+<form method="post">
+    {% csrf_token %}
+    <label>Your Full Name:</label>
+    <input type="text" name="user_name" required><br>
+
+    <label>Recipient Full Name:</label>
+    <input type="text" name="recipient_name" required><br>
+
+    <label>Recipient Email:</label>
+    <input type="email" name="recipient_email" required><br>
+
+    <button type="submit">Generate & Send to DocuSign</button>
+</form>
+{% endblock %}
