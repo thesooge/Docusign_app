@@ -4,8 +4,11 @@ from django.urls import reverse
 from docx import Document
 from django.conf import settings
 from django.http import HttpResponse
-from django.views.generic import ListView 
+from django.views.generic import ListView
 from django.contrib import messages
+from django.utils import timezone
+from datetime import timedelta
+from urllib.parse import urlencode
 
 import os
 import base64
@@ -14,22 +17,103 @@ from docx2pdf import convert
 import ctypes
 import logging
 
-from .models import Contract
+from .models import Contract, DocusignProfile
 
-
-# generate logger
 logger = logging.getLogger(__name__)
 
-# for error converting docx to pdf
-ole32 = ctypes.windll.ole32
-result = ole32.CoInitialize(None)
+if os.name == "nt":
+    ole32 = ctypes.windll.ole32
+    result = ole32.CoInitialize(None)
+else:
+    ole32 = None
+    result = None
 
-DOCUSIGN_ACCOUNT_ID = settings.DOCUSIGN_ACCOUNT_ID
-DOCUSIGN_ACCESS_TOKEN = settings.DOCUSIGN_ACCESS_TOKEN
-DOCUSIGN_REFRESH_TOKEN = settings.DOCUSIGN_REFRESH_TOKEN
-DOCUSIGN_CLIENT_ID = settings.DOCUSIGN_CLIENT_ID
-DOCUSIGN_CLIENT_SECRET = settings.DOCUSIGN_CLIENT_SECRET
-DOCUSIGN_API_BASE_URL = "https://demo.docusign.net/restapi/v2.1"
+def docusign_login(request):
+    redirect_uri = request.build_absolute_uri(reverse('docusign_callback'))
+    print(redirect_uri)
+    params = {
+        "response_type": "code",
+        "scope": "signature",
+        "client_id": settings.DOCUSIGN_CLIENT_ID,
+        "redirect_uri": redirect_uri
+    }
+    url = f"https://account-d.docusign.com/oauth/auth?{urlencode(params)}"
+    return redirect(url)
+
+def docusign_callback(request):
+    code = request.GET.get("code")
+    if not code:
+        return HttpResponse("No code provided")
+
+    redirect_uri = request.build_absolute_uri(reverse('docusign_callback'))
+    data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": settings.DOCUSIGN_CLIENT_ID,
+        "client_secret": settings.DOCUSIGN_CLIENT_SECRET,
+        "redirect_uri": redirect_uri
+    }
+
+    response = requests.post("https://account-d.docusign.com/oauth/token", data=data)
+
+    if response.status_code == 200:
+        token_data = response.json()
+        access_token = token_data["access_token"]
+        refresh_token = token_data["refresh_token"]
+        expires_in = token_data["expires_in"]
+
+        # Fetch account info from /userinfo endpoint
+        userinfo_response = requests.get(
+            "https://account-d.docusign.com/oauth/userinfo",
+            headers={"Authorization": f"Bearer {access_token}"}
+        )
+
+        if userinfo_response.status_code != 200:
+            return HttpResponse("Failed to get user info from DocuSign")
+
+        userinfo = userinfo_response.json()
+        account_info = userinfo["accounts"][0]
+        account_id = account_info["account_id"]
+        base_uri = account_info["base_uri"]
+
+        # Save profile
+        DocusignProfile.objects.update_or_create(
+            user=request.user,
+            defaults={
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "token_expiry": timezone.now() + timedelta(seconds=int(expires_in)),
+                "account_id": account_id,
+                "base_uri": base_uri
+            }
+        )
+
+        return redirect("contract_instantiation")
+
+    return HttpResponse("Failed to authenticate with DocuSign")
+
+def get_user_token(user):
+    profile = DocusignProfile.objects.filter(user=user).first()
+    if not profile:
+        return None
+
+    if timezone.now() >= profile.token_expiry:
+        data = {
+            "grant_type": "refresh_token",
+            "refresh_token": profile.refresh_token,
+            "client_id": settings.DOCUSIGN_CLIENT_ID,
+            "client_secret": settings.DOCUSIGN_CLIENT_SECRET
+        }
+        response = requests.post("https://account-d.docusign.com/oauth/token", data=data)
+        if response.status_code == 200:
+            token_data = response.json()
+            profile.access_token = token_data["access_token"]
+            profile.refresh_token = token_data["refresh_token"]
+            profile.token_expiry = timezone.now() + timedelta(seconds=int(token_data["expires_in"]))
+            profile.save()
+        else:
+            return None
+    return profile.access_token, profile.account_id
 
 def create_contract(request):
     if request.method == "POST":
@@ -37,83 +121,61 @@ def create_contract(request):
         recipient_name = request.POST["recipient_name"]
         recipient_email = request.POST["recipient_email"]
 
-        # create a Word document as told in doc
         doc = Document()
         doc.add_heading("Contract Agreement", level=1)
         doc.add_paragraph(f"Party 1: {user_name}")
         doc.add_paragraph(f"Party 2: {recipient_name}")
         doc.add_paragraph("\nThis agreement is binding and requires signatures.")
 
-        # save doc in media root
         contract_filename = f"contract_{user_name}_{recipient_name}.docx"
         contract_path = os.path.join(settings.MEDIA_ROOT, contract_filename)
         doc.save(contract_path)
-
-        # redirect to DocuSign with parameters
         return redirect(reverse("send_to_docusign") + f"?contract_path={contract_filename}&recipient_email={recipient_email}&user_name={user_name}&recipient_name={recipient_name}")
 
     return render(request, "contracts/contract_form.html")
 
 def encode_file_to_base64(file_path):
-    """convert a file to Base64 encoding."""
     if not os.path.exists(file_path):
-        return None  # handle missing files
+        return None
     with open(file_path, "rb") as f:
-        # change and send it
         return base64.b64encode(f.read()).decode("utf-8")
 
 def submit_contract_to_docusign(request):
+    user = request.user
+    token_account = get_user_token(user)
+    if not token_account:
+        return redirect("docusign_login")
 
-    #get parameteers from url
+    access_token, account_id = token_account
+
     user_name = request.GET.get("user_name")
     recipient_name = request.GET.get("recipient_name")
     contract_filename = request.GET.get("contract_path")
     recipient_email = request.GET.get("recipient_email")
 
     if not all([contract_filename, recipient_email, user_name, recipient_name]):
-        messages.error(request, "Error: Missing contract file or recipient email.")
+        messages.error(request, "Missing required information.")
         return redirect("contract_instantiation")
 
     contract_path = os.path.join(settings.MEDIA_ROOT, contract_filename)
-    # create obj in DB
-    #print(contract_path)
-    contract = Contract.objects.create(user_name=user_name,recipient_email=recipient_email,recipient_name=recipient_name,contract_file = contract_filename)
-    
-    # refresh the token if needed
-    new_token = refresh_access_token()
-    if new_token:
-        DOCUSIGN_ACCESS_TOKEN = new_token
+    pdf_path = contract_path.replace(".docx", ".pdf")
 
-    # Convert to PDF
-    if contract_path.endswith(".docx"):
-        # replace the end of it
-        pdf_path = contract_path.replace(".docx", ".pdf")
-    else:
-        pdf_path = contract_path    
+    try:
+        convert(contract_path, pdf_path)
+    except Exception as e:
+        return HttpResponse(f"Conversion error: {str(e)}")
 
-    if contract_path.endswith(".docx"):
-        try:
-            convert(contract_path, pdf_path)  # Convert DOCX to PDF
-        except Exception as e:
-            return HttpResponse(f"Error converting DOCX to PDF: {str(e)}")
-        
-    if not os.path.exists(pdf_path):
-        messages.error(request, "Error: Could not convert the contract to PDF.")
-        return redirect("contract_instantiation")
-
-    # prepare DocuSign request as doc 
-    url = f"{DOCUSIGN_API_BASE_URL}/accounts/{DOCUSIGN_ACCOUNT_ID}/envelopes"
-    headers = {
-        "Authorization": f"Bearer {DOCUSIGN_ACCESS_TOKEN}",
-        "Content-Type": "application/json"
-    }
-
-    # convert PDF file to Base64 encoding for API request
     encoded_pdf = encode_file_to_base64(pdf_path)
     if not encoded_pdf:
-        return HttpResponse("Error: Could not read the PDF file!")
+        return HttpResponse("Error reading PDF.")
 
-    # create envelope wie doc (email detail)
+    contract = Contract.objects.create(
+        user_name=user_name,
+        recipient_email=recipient_email,
+        recipient_name=recipient_name,
+        contract_file=contract_filename
+    )
+
     envelope_data = {
         "emailSubject": "Contract Agreement - Please Sign",
         "documents": [{
@@ -135,76 +197,50 @@ def submit_contract_to_docusign(request):
         "status": "sent"
     }
 
+    url = f"https://demo.docusign.net/restapi/v2.1/accounts/{account_id}/envelopes"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+
     response = requests.post(url, headers=headers, json=envelope_data)
-    
     if response.status_code == 201:
         envelope_id = response.json().get("envelopeId")
-        #save id in DB to use it later
         contract.document_id = envelope_id
         contract.save()
-        #print(contract)
-        # send email to the recipient
         notify_recipient(recipient_email, envelope_id)
         return redirect("success_page")
-    else:
-        return HttpResponse("Error sending contract: " + response.text)
+    return HttpResponse("Error sending contract: " + response.text)
 
 def notify_recipient(email, contract_url):
     subject = "Contract Agreement - Please Sign"
     message = f"Please sign the contract using the following link: {contract_url}"
-
     try:
         send_mail(subject, message, settings.DEFAULT_FROM_EMAIL, [email])
     except Exception as e:
         logger.error(f"Error sending email to {email}: {str(e)}")
 
-# load this page as succesed action
 def success_page(request):
     return render(request, "contracts/success.html")
 
-# avoid token expiray we refresh the access token with refresh token
-def refresh_access_token():
-    global DOCUSIGN_ACCESS_TOKEN
-
-    url = "https://account-d.docusign.com/oauth/token"
-    data = {
-        "grant_type": "refresh_token",
-        "refresh_token": DOCUSIGN_REFRESH_TOKEN,
-        "client_id": DOCUSIGN_CLIENT_ID,
-        "client_secret": DOCUSIGN_CLIENT_SECRET
-    }
-    response = requests.post(url, data=data)
-    if response.status_code == 200:
-        new_token = response.json().get("access_token")
-        # update token
-        settings.DOCUSIGN_ACCESS_TOKEN = new_token  
-        return new_token
-    return None
-
 def is_contract_signed(contract):
-    """check if the contract has been signed."""
-    url = f"https://demo.docusign.net/restapi/v2.1/accounts/{DOCUSIGN_ACCOUNT_ID}/envelopes/{contract.document_id}"
-    new_token = refresh_access_token()
-    if new_token:
-        DOCUSIGN_ACCESS_TOKEN = new_token
+    profile = DocusignProfile.objects.filter(user__username=contract.user_name).first()
+    if not profile:
+        return False
+    token, account_id = get_user_token(profile.user)
+    url = f"https://demo.docusign.net/restapi/v2.1/accounts/{account_id}/envelopes/{contract.document_id}"
     headers = {
-        "Authorization": f"Bearer {DOCUSIGN_ACCESS_TOKEN}",
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
     }
     response = requests.get(url, headers=headers)
-    # in this respone there is everything we needed
-    
     if response.status_code == 200:
-        print(response.json())
-        status = response.json().get("status")
-        # signed status
-        if status == "completed": 
+        if response.json().get("status") == "completed":
             contract.is_signed = True
             contract.save()
             return True
     return False
 
-# list the contracts
 class ContractListView(ListView):
     model = Contract
     template_name = "contracts/contract_list.html"
@@ -213,10 +249,8 @@ class ContractListView(ListView):
         contract_id = request.POST.get("contract_id")
         if contract_id:
             contract = get_object_or_404(Contract, id=contract_id)
-            is_signed = is_contract_signed(contract)
-            if is_signed:
-                messages.success(request, f"Contract '{contract.id}' has been signed successfully.")
+            if is_contract_signed(contract):
+                messages.success(request, f"Contract '{contract.id}' is signed.")
             else:
-                messages.warning(request, f"Contract '{contract.id}' has not been signed yet.")
-                
+                messages.warning(request, f"Contract '{contract.id}' is not signed.")
         return self.get(request, *args, **kwargs)

@@ -1,10 +1,11 @@
 from django.urls import path
-from .views import create_contract, submit_contract_to_docusign, success_page, ContractListView
+from . import views
 
 urlpatterns = [
-    path("create/", create_contract, name="contract_instantiation"),
-    path("send_to_docusign/", submit_contract_to_docusign, name="send_to_docusign"),
-    path("success/", success_page, name="success_page"),
-    path("contracts/", ContractListView.as_view(), name="contract_list"),
-
+    path("", views.ContractListView.as_view(), name="contract_list"),
+    path("create/", views.create_contract, name="contract_instantiation"),
+    path("send/", views.submit_contract_to_docusign, name="send_to_docusign"),
+    path("success/", views.success_page, name="success_page"),
+    path("docusign/login/", views.docusign_login, name="docusign_login"),
+    path("docusign/callback/", views.docusign_callback, name="docusign_callback"),
 ]
